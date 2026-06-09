@@ -1,8 +1,8 @@
-"""A tiny neural-net layer on top of the autodiff core.
+"""Tiny neural-net utilities on top of the autodiff core.
 
-Nothing here knows how to compute a gradient — it just composes Tensor ops,
-and the engine differentiates the whole thing. That's the point: once the VJPs
-in ``tensor.py`` are right, a multi-layer network trains for free.
+Layers and optimizers just compose or consume Tensor ops. The fused
+``cross_entropy`` loss has its own VJP for numerical stability, while the rest
+of the module relies on the engine in ``tensor.py``.
 """
 
 from __future__ import annotations
@@ -46,7 +46,11 @@ class MLP:
 
 
 class SGD:
-    """Plain stochastic gradient descent with optional momentum."""
+    """Plain stochastic gradient descent with optional momentum.
+
+    Gradients accumulate in Tensor buffers, so call ``zero_grad()`` before each
+    optimization step unless intentionally accumulating across minibatches.
+    """
 
     def __init__(self, params, lr=0.1, momentum=0.0):
         self.params = list(params)
@@ -55,18 +59,21 @@ class SGD:
         self._vel = [np.zeros_like(p.data) for p in self.params]
 
     def zero_grad(self):
+        """Clear all parameter gradient buffers."""
         for p in self.params:
             p.zero_grad()
 
     def step(self):
         for i, p in enumerate(self.params):
+            if not p.requires_grad:
+                continue
             self._vel[i] = self.momentum * self._vel[i] - self.lr * p.grad
             p.data += self._vel[i]
 
 
 # ----------------------------------------------------------------- losses
 def mse_loss(pred: Tensor, target) -> Tensor:
-    target = target if isinstance(target, Tensor) else Tensor(target)
+    target = target if isinstance(target, Tensor) else Tensor(target, requires_grad=False)
     diff = pred - target
     return (diff * diff).mean()
 
@@ -85,13 +92,13 @@ def cross_entropy(logits: Tensor, targets: np.ndarray) -> Tensor:
     probs = exp / exp.sum(axis=1, keepdims=True)
     n = z.shape[0]
     loss_val = -np.log(probs[np.arange(n), targets] + 1e-12).mean()
-    out = Tensor(loss_val, (logits,), "cross_entropy")
+    out = Tensor(loss_val, (logits,), "cross_entropy", requires_grad=logits.requires_grad)
 
     def _backward():
         grad = probs.copy()
         grad[np.arange(n), targets] -= 1.0          # softmax - onehot
         grad /= n
-        logits.grad += grad * out.grad
+        logits._add_grad(grad * out.grad)
 
     out._backward = _backward
     return out

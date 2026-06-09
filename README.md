@@ -1,8 +1,8 @@
 # nabla ∇
 
 **A reverse-mode automatic differentiation engine, written from scratch on
-NumPy.** No PyTorch, no TensorFlow, no autograd library — just the chain rule,
-implemented and *proven correct*.
+NumPy.** No PyTorch, no TensorFlow, no autograd library -- just the chain rule,
+implemented with hand-derived VJPs and finite-difference checks.
 
 ```python
 from nabla import Tensor
@@ -52,20 +52,23 @@ it's *actually* right. This repo treats correctness as the deliverable:
 
 **Neural nets** (`nabla/nn.py`): `Linear` (He init), `MLP`, `SGD` (with
 momentum), `mse_loss`, and a fused, numerically-stable softmax `cross_entropy`.
-None of these compute a gradient themselves — they just compose `Tensor` ops and
-let the engine differentiate the whole graph.
+The layers and `mse_loss` compose `Tensor` ops; `cross_entropy` has a fused VJP
+for the standard softmax-loss gradient.
 
 ---
 
 ## How reverse-mode works, in three sentences
 
-Each operation records the tensors that produced it, forming a DAG. `backward()`
-walks that DAG in reverse topological order so every node is visited only after
-everything depending on it, seeds the output gradient with `1`, and applies each
-op's VJP to push gradients toward the inputs. One backward pass computes the
-gradient w.r.t. *every* parameter at once — that's the asymptotic win over
-differentiating each parameter separately, and it's why neural nets are trainable
-at all.
+Each operation records the grad-enabled tensors that produced it, forming a DAG:
+user-created grad-tracking tensors with no parents are leaves/parameters, while
+op outputs are non-leaf intermediates. `backward()` walks that DAG in reverse
+topological order so every node is visited only after everything depending on
+it, seeds the output cotangent with `1`, applies each op's VJP, and accumulates
+the result into public `.grad` buffers instead of clearing them. Non-leaf `.grad`
+is exposed for inspection, but the training contract is to call `zero_grad()` on
+leaves/optimizer parameters before a new step or accumulation window; repeated
+`backward()` calls accumulate into leaf `.grad` by design, enabling gradient
+accumulation across minibatches and explaining why `optimizer.zero_grad()` exists.
 
 ---
 

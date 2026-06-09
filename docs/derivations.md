@@ -30,23 +30,29 @@ For `y_i = f(x_i)`, the Jacobian is `diag(f'(x_i))`, so
 
 | op | `f(x)` | `f'(x)` | code |
 |----|--------|---------|------|
-| `exp`  | `eˣ`        | `eˣ = y`            | `self.grad += e * out.grad` |
-| `log`  | `ln x`      | `1/x`               | `self.grad += (1/self.data) * out.grad` |
-| `tanh` | `tanh x`    | `1 − tanh²x = 1 − y²` | `self.grad += (1 - t*t) * out.grad` |
-| `relu` | `max(0,x)`  | `1[x>0]`            | `self.grad += (self.data > 0) * out.grad` |
-| `pow`  | `xᵏ`        | `k·xᵏ⁻¹`            | `self.grad += (k * self.data**(k-1)) * out.grad` |
+| `exp`  | `eˣ`        | `eˣ = y`            | `self._add_grad(e * out.grad)` |
+| `log`  | `ln x`      | `1/x`               | `self._add_grad((1/self.data) * out.grad)` |
+| `tanh` | `tanh x`    | `1 − tanh²x = 1 − y²` | `self._add_grad((1 - t*t) * out.grad)` |
+| `relu` | `max(0,x)`  | `1[x>0]`            | `self._add_grad((self.data > 0) * out.grad)` |
+| `pow`  | `xᵏ`        | `k·xᵏ⁻¹`            | `self._add_grad((k * self.data**(k-1)) * out.grad)` |
 
 `tanh` is the one worth noticing: writing the derivative as `1 − y²` reuses the
 forward output, so backward costs one multiply and no recomputation.
 
+`log` is defined for positive inputs. Fractional powers of negative inputs and
+division by zero are outside this real-valued engine's domain, so the code raises
+instead of silently propagating `nan` or `inf`.
+
 ---
 
-## Add and multiply, with broadcasting
+## Add, subtract, multiply, and divide, with broadcasting
 
 Ignoring shapes first:
 
 - `y = a + b` ⇒ `∂L/∂a = ḡ`, `∂L/∂b = ḡ`.
+- `y = a - b` ⇒ `∂L/∂a = ḡ`, `∂L/∂b = -ḡ`.
 - `y = a ⊙ b` ⇒ `∂L/∂a = b ⊙ ḡ`, `∂L/∂b = a ⊙ ḡ` (product rule).
+- `y = a / b` ⇒ `∂L/∂a = ḡ / b`, `∂L/∂b = -(a / b²) ⊙ ḡ`.
 
 **The subtlety is broadcasting.** When `a` has shape `(4,5)` and `b` has shape
 `(5,)`, NumPy copies `b` across all 4 rows before multiplying. `b` therefore
@@ -57,11 +63,12 @@ gradient is the **sum** of the per-row contributions:
 ∂L/∂b = Σ_rows (a ⊙ ḡ)
 ```
 
-That summation is exactly what `_unbroadcast` does — it sums out any axis that
-was stretched from size 1 (or prepended) during the forward broadcast, so the
-returned gradient matches the operand's original shape. Forgetting this is the
-classic silent bug: the code runs, the shapes happen to work after a stray
-broadcast, and the gradients are quietly wrong. The broadcasting test catches it.
+That summation is exactly what `_unbroadcast` does for each operand's local VJP
+contribution -- it sums out any axis that was stretched from size 1 (or
+prepended) during the forward broadcast, so the returned gradient matches the
+operand's original shape. Forgetting this is the classic silent bug: the code
+runs, the shapes happen to work after a stray broadcast, and the gradients are
+quietly wrong. The broadcasting tests catch it.
 
 ---
 
@@ -126,4 +133,5 @@ is done analytically instead of numerically.
 grad = probs.copy()
 grad[arange(N), targets] -= 1     # p - onehot
 grad /= N
+logits._add_grad(grad * out.grad)
 ```
