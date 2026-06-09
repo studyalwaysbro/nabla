@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nabla-autograd"
+version = "0.1.0"
+description = "A from-scratch reverse-mode automatic differentiation engine on NumPy, with hand-derived, finite-difference-verified gradients."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["autograd", "automatic-differentiation", "backpropagation", "numpy", "neural-network", "vjp"]
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["nabla*"]
