@@ -7,11 +7,15 @@ autodiff engine is computing correct gradients through two nonlinear layers.
 """
 
 import numpy as np
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from nabla import MLP, SGD, Tensor, mse_loss
 
-X = Tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
-Y = Tensor([[0.0], [1.0], [1.0], [0.0]])
+X = Tensor([[0, 0], [0, 1], [1, 0], [1, 1]], requires_grad=False)
+Y = Tensor([[0.0], [1.0], [1.0], [0.0]], requires_grad=False)
 
 rng = np.random.default_rng(1)
 net = MLP([2, 8, 1], rng, activation="tanh")

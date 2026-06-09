@@ -14,7 +14,17 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from nabla import MLP, SGD, Tensor, cross_entropy, mse_loss
+from nabla import (
+    Adam,
+    AdamW,
+    MLP,
+    SGD,
+    Tensor,
+    clip_grad_norm_,
+    cross_entropy,
+    mse_loss,
+    no_grad,
+)
 
 
 def numeric_grad(f, t: Tensor, eps=1e-6) -> np.ndarray:
@@ -93,6 +103,29 @@ def test_matmul():
     assert_close(gw, numeric_grad(f, w), "matmul dW")
 
 
+def test_batched_matmul_gradcheck():
+    a = Tensor(rng.standard_normal((2, 3, 4)))
+    w = Tensor(rng.standard_normal((2, 4, 5)))
+    f = lambda: (a @ w).tanh().sum()
+    ga, gw = analytic_grad(f, a, w)
+    assert_close(ga, numeric_grad(f, a), "batched matmul dA")
+    assert_close(gw, numeric_grad(f, w), "batched matmul dW")
+
+
+def test_batched_matmul_broadcasts_shared_rhs_gradcheck():
+    a = Tensor(rng.standard_normal((2, 3, 4)))
+    w = Tensor(rng.standard_normal((4, 5)))
+    f = lambda: (a @ w).tanh().sum()
+    ga, gw = analytic_grad(f, a, w)
+    assert_close(ga, numeric_grad(f, a), "broadcast matmul dA")
+    assert_close(gw, numeric_grad(f, w), "broadcast matmul dW")
+
+
+def test_matmul_rejects_vector_operands():
+    assert_raises(ValueError, lambda: Tensor(rng.standard_normal((3,))) @ Tensor(rng.standard_normal((3, 2))))
+    assert_raises(ValueError, lambda: Tensor(rng.standard_normal((2, 3))) @ Tensor(rng.standard_normal((3,))))
+
+
 def test_mean_and_pow():
     x = Tensor(rng.standard_normal((6,)) + 3.0)   # keep positive for **0.5
     f = lambda: ((x ** 2).mean() + (x ** 0.5).sum() + x.log().sum())
@@ -153,6 +186,23 @@ def test_repeated_backward_accumulates_without_zero_grad():
 
     assert_close(gx, numeric_grad(fresh_graph, x), "repeat backward numeric dx")
     assert_close(gw, numeric_grad(fresh_graph, w), "repeat backward numeric dw")
+
+
+def test_backward_handles_deep_graph_iteratively():
+    x = Tensor(1.0)
+    y = x
+    for _ in range(5000):
+        y = y * 1.0
+    y.backward()
+    assert_close(x.grad, np.array(1.0), "deep chain dx", tol=1e-12)
+
+
+def test_backward_rejects_reentrant_calls():
+    Tensor._active_backward_grads = {}
+    try:
+        assert_raises(RuntimeError, lambda: Tensor(1.0).backward())
+    finally:
+        Tensor._active_backward_grads = None
 
 
 def test_repeated_backward_with_leaf_zero_grad_recomputes_leaf_grads():
@@ -217,6 +267,85 @@ def test_requires_grad_false_leaf_is_constant():
     (x * w).sum().backward()
     assert x.grad is None
     assert_close(w.grad, x.data, "constant leaf skips grad")
+
+
+def test_tensor_constructor_copies_array_data():
+    arr = np.ones(3)
+    t = Tensor(arr, requires_grad=False)
+    arr[0] = 99.0
+    assert_close(t.data, np.ones(3), "constructor copies data", tol=1e-12)
+
+
+def test_mse_loss_rejects_broadcasting_shapes():
+    pred = Tensor(np.zeros((4, 1)))
+    target = np.zeros((4,))
+    assert_raises(ValueError, lambda: mse_loss(pred, target))
+
+
+def test_no_grad_outputs_have_no_graph():
+    x = Tensor(np.array([1.0, 2.0, 3.0]))
+    with no_grad():
+        y = ((x * 2.0) + 1.0).sum()
+        z = x.sum()
+    assert not y.requires_grad
+    assert y.grad is None
+    assert y._prev == set()
+    assert not z.requires_grad
+    assert z._prev == set()
+    assert_raises(RuntimeError, y.backward)
+
+
+def test_detach_stops_gradient_and_copies_data():
+    x = Tensor(np.array([2.0, 3.0]))
+    d = x.detach()
+    x.data[0] = 10.0
+    assert_close(d.data, np.array([2.0, 3.0]), "detach copies data", tol=1e-12)
+
+    x = Tensor(np.array([2.0, 3.0]))
+    (x * x.detach()).sum().backward()
+    assert_close(x.grad, np.array([2.0, 3.0]), "detach boundary dx", tol=1e-12)
+
+
+def test_adam_decreases_quadratic_loss():
+    p = Tensor(np.array([3.0, -4.0]))
+    opt = Adam([p], lr=0.05)
+    start = float((p * p).sum().data)
+    for _ in range(8):
+        opt.zero_grad()
+        loss = (p * p).sum()
+        loss.backward()
+        opt.step()
+    end = float((p * p).sum().data)
+    assert end < start
+
+
+def test_adam_bias_correction_first_step():
+    p = Tensor(np.array([1.0, -2.0]))
+    p.grad = np.array([0.5, -0.25])
+    opt = Adam([p], lr=0.1, betas=(0.9, 0.999), eps=1e-8)
+    opt.step()
+    expected = np.array([1.0, -2.0]) - 0.1 * np.array([0.5, -0.25]) / (np.array([0.5, 0.25]) + 1e-8)
+    assert_close(p.data, expected, "adam first step", tol=1e-12)
+
+
+def test_adamw_decoupled_decay_shrinks_zero_grad_weights():
+    p = Tensor(np.array([2.0, -3.0]))
+    p.grad = np.zeros_like(p.data)
+    opt = AdamW([p], lr=0.1, weight_decay=0.01)
+    opt.step()
+    assert_close(p.data, np.array([2.0, -3.0]) * (1.0 - 0.1 * 0.01), "adamw decoupled decay", tol=1e-12)
+
+
+def test_clip_grad_norm_returns_preclip_norm_and_scales():
+    a = Tensor(np.array([0.0, 0.0]))
+    b = Tensor(np.array([0.0]))
+    a.grad = np.array([3.0, 4.0])
+    b.grad = np.array([12.0])
+    norm = clip_grad_norm_([a, b], 5.0)
+    scale = 5.0 / (13.0 + 1e-6)
+    assert abs(norm - 13.0) < 1e-12
+    assert_close(a.grad, np.array([3.0, 4.0]) * scale, "clip grad a", tol=1e-12)
+    assert_close(b.grad, np.array([12.0]) * scale, "clip grad b", tol=1e-12)
 
 
 def test_mlp_train_step_unaffected():

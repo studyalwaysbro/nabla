@@ -13,6 +13,9 @@ y.backward()
 print(x.grad)              # [[2. 4. 6.]]   (∂y/∂xᵢ = 2xᵢ)
 ```
 
+`Tensor(...)` defaults to `requires_grad=True` in this repo; pass
+`requires_grad=False` for data and constants.
+
 That's a toy. The engine is real enough to train a neural net:
 
 ```bash
@@ -48,12 +51,14 @@ it's *actually* right. This repo treats correctness as the deliverable:
 
 **Core** (`nabla/tensor.py`) — one `Tensor` class, ~200 lines:
 `+`, `*`, `−`, `/`, `**`, `@` (matmul), `sum`, `mean`, `relu`, `tanh`, `exp`,
-`log`, all with broadcasting-aware VJPs and reverse-topological `backward()`.
+`log`, all with broadcasting-aware VJPs and reverse-topological `backward()`,
+plus `no_grad()` and `detach()` for inference and graph boundaries.
 
 **Neural nets** (`nabla/nn.py`): `Linear` (He init), `MLP`, `SGD` (with
-momentum), `mse_loss`, and a fused, numerically-stable softmax `cross_entropy`.
-The layers and `mse_loss` compose `Tensor` ops; `cross_entropy` has a fused VJP
-for the standard softmax-loss gradient.
+momentum), `Adam`, `AdamW`, `clip_grad_norm_`, `mse_loss`, and a fused,
+numerically-stable softmax `cross_entropy`. The layers and `mse_loss` compose
+`Tensor` ops; `cross_entropy` has a fused VJP for the standard softmax-loss
+gradient.
 
 ---
 
@@ -69,6 +74,10 @@ is exposed for inspection, but the training contract is to call `zero_grad()` on
 leaves/optimizer parameters before a new step or accumulation window; repeated
 `backward()` calls accumulate into leaf `.grad` by design, enabling gradient
 accumulation across minibatches and explaining why `optimizer.zero_grad()` exists.
+Do not mutate `.data` between a forward pass and its `backward()` call: several
+VJPs re-read raw `ndarray` buffers, so in-place NumPy writes can corrupt the
+gradient. Double backward is not supported because VJPs operate on raw ndarrays,
+not on a graph-building tensor layer during backward.
 
 ---
 
@@ -85,10 +94,8 @@ Requires Python ≥ 3.10 and NumPy.
 
 ## Roadmap
 
-- `Conv2d` and a max-pool VJP
-- Adam optimizer
+- `Conv2d` and a max-pool VJP are deferred
 - a `graphviz` dump of the computation DAG
-- optional CuPy backend (drop-in for NumPy) to run on a GPU
 
 ## License
 

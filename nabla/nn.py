@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from nabla.tensor import Tensor
+from nabla.tensor import Tensor, _requires_grad
 
 
 class Linear:
@@ -71,9 +71,82 @@ class SGD:
             p.data += self._vel[i]
 
 
+class Adam:
+    """Bias-corrected Adam optimizer."""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+        self.params = list(params)
+        self.lr = lr
+        self.beta1, self.beta2 = betas
+        self.eps = eps
+        self.t = 0
+        self._m = [np.zeros_like(p.data) for p in self.params]
+        self._v = [np.zeros_like(p.data) for p in self.params]
+
+    def zero_grad(self):
+        """Clear all parameter gradient buffers."""
+        for p in self.params:
+            p.zero_grad()
+
+    def step(self):
+        self.t += 1
+        beta1_t = self.beta1 ** self.t
+        beta2_t = self.beta2 ** self.t
+        for i, p in enumerate(self.params):
+            if not p.requires_grad or p.grad is None:
+                continue
+            g = p.grad
+            self._m[i] = self.beta1 * self._m[i] + (1.0 - self.beta1) * g
+            self._v[i] = self.beta2 * self._v[i] + (1.0 - self.beta2) * (g * g)
+            m_hat = self._m[i] / (1.0 - beta1_t)
+            v_hat = self._v[i] / (1.0 - beta2_t)
+            p.data -= self.lr * (m_hat / (np.sqrt(v_hat) + self.eps))
+
+
+class AdamW(Adam):
+    """Adam with decoupled weight decay."""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        super().__init__(params, lr=lr, betas=betas, eps=eps)
+        self.weight_decay = weight_decay
+
+    def step(self):
+        self.t += 1
+        beta1_t = self.beta1 ** self.t
+        beta2_t = self.beta2 ** self.t
+        for i, p in enumerate(self.params):
+            if not p.requires_grad or p.grad is None:
+                continue
+            g = p.grad
+            self._m[i] = self.beta1 * self._m[i] + (1.0 - self.beta1) * g
+            self._v[i] = self.beta2 * self._v[i] + (1.0 - self.beta2) * (g * g)
+            m_hat = self._m[i] / (1.0 - beta1_t)
+            v_hat = self._v[i] / (1.0 - beta2_t)
+            adam_step = m_hat / (np.sqrt(v_hat) + self.eps)
+            p.data -= self.lr * (adam_step + self.weight_decay * p.data)
+
+
+def clip_grad_norm_(params, max_norm):
+    """Clip gradients by global L2 norm and return the pre-clip norm."""
+    params = list(params)
+    total_sq = 0.0
+    for p in params:
+        if p.requires_grad and p.grad is not None:
+            total_sq += float(np.sum(p.grad * p.grad))
+    total_norm = float(np.sqrt(total_sq))
+    if total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-6)
+        for p in params:
+            if p.requires_grad and p.grad is not None:
+                p.grad *= scale
+    return total_norm
+
+
 # ----------------------------------------------------------------- losses
 def mse_loss(pred: Tensor, target) -> Tensor:
     target = target if isinstance(target, Tensor) else Tensor(target, requires_grad=False)
+    if pred.data.shape != target.data.shape:
+        raise ValueError("mse_loss requires pred and target to have exactly matching shapes")
     diff = pred - target
     return (diff * diff).mean()
 
@@ -92,7 +165,7 @@ def cross_entropy(logits: Tensor, targets: np.ndarray) -> Tensor:
     probs = exp / exp.sum(axis=1, keepdims=True)
     n = z.shape[0]
     loss_val = -np.log(probs[np.arange(n), targets] + 1e-12).mean()
-    out = Tensor(loss_val, (logits,), "cross_entropy", requires_grad=logits.requires_grad)
+    out = Tensor(loss_val, (logits,), "cross_entropy", requires_grad=_requires_grad(logits))
 
     def _backward():
         grad = probs.copy()
@@ -100,5 +173,6 @@ def cross_entropy(logits: Tensor, targets: np.ndarray) -> Tensor:
         grad /= n
         logits._add_grad(grad * out.grad)
 
-    out._backward = _backward
+    if out.requires_grad:
+        out._backward = _backward
     return out

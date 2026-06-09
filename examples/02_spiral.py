@@ -9,6 +9,10 @@ the activations.
 """
 
 import numpy as np
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from nabla import MLP, SGD, Tensor, cross_entropy
 
@@ -27,7 +31,7 @@ def make_spiral(points_per_class=100, classes=3, seed=0):
 
 
 X_np, y_np = make_spiral()
-X = Tensor(X_np)
+X = Tensor(X_np, requires_grad=False)
 
 rng = np.random.default_rng(2)
 net = MLP([2, 64, 64, 3], rng, activation="relu")
