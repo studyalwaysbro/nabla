@@ -109,6 +109,145 @@ separate rule needed, which is a small proof that the op set composes.
 
 ---
 
+## Shape ops
+
+Shape-only transforms do not change values, only where those values live.
+Their VJPs are therefore the inverse shape movement.
+
+For `y = reshape(x, shape)`, each output element is the same storage-order entry
+as one input element, so the gradient just returns to the original shape:
+
+```
+∂L/∂x = reshape(ḡ_y, x.shape)
+```
+
+For `y = transpose(x, axes)`, the forward permutes axes. The backward applies
+the inverse permutation:
+
+```
+inverse = argsort(axes)
+∂L/∂x = transpose(ḡ_y, inverse)
+```
+
+Indexing is the adjoint of gathering. If `y = x[idx]`, the same input position
+can be gathered multiple times. The gradient for that position is the sum of all
+uses:
+
+```
+dx = zeros_like(x)
+add_at(dx, idx, ḡ_y)
+```
+
+The `add_at` matters. Plain `dx[idx] += ḡ_y` looks equivalent but silently loses
+updates for repeated integer indices because NumPy buffers the advanced-indexed
+write. A gradcheck with repeated indices guards this exact trap.
+
+For `concat([x₀, x₁, ...], axis)`, the forward lays tensors end-to-end. The VJP
+splits `ḡ_y` at the same cumulative sizes and sends each slice back to its input.
+For `stack`, the forward inserts a new axis, so input `i` receives
+`take(ḡ_y, i, axis)`.
+
+---
+
+## Sigmoid, logsumexp, and softmax
+
+For `s = sigmoid(x) = 1 / (1 + e^{-x})`, differentiating gives:
+
+```
+∂L/∂x = s ⊙ (1 - s) ⊙ ḡ_s
+```
+
+The stable `logsumexp` reduction is:
+
+```
+m = max(x)
+y = m + log Σ_j exp(x_j - m)
+```
+
+Although the shift `m` depends on `x`, it is added outside and subtracted inside
+the exponential sum, so its derivative terms cancel wherever the max is
+differentiable. The remaining derivative is the normalized exponential:
+
+```
+∂y/∂x_i = exp(x_i - y)
+∂L/∂x_i = exp(x_i - y) · broadcast(ḡ_y)_i
+```
+
+For `p = softmax(x)`, the Jacobian is:
+
+```
+∂p_i/∂x_j = p_i (1[i=j] - p_j)
+```
+
+Multiplying by upstream gradient `ḡ_p` collapses the Jacobian into the VJP:
+
+```
+∂L/∂x = p ⊙ (ḡ_p - Σ_j ḡ_p_j p_j)
+```
+
+The cross-entropy cancellation is the same fact in loss form. For one row of
+logits and target `y`:
+
+```
+CE(z, y) = logsumexp(z) - z_y
+∂CE/∂z_k = softmax(z)_k - 1[k = y]
+```
+
+That is why `nn.cross_entropy` can use the fused `(softmax(z) - onehot(y)) / N`
+VJP: composing `logsumexp(z) - z_y` would derive the same gradient, but the
+fused loss avoids numerically materializing the unstable intermediate terms.
+
+---
+
+## Max and min reductions
+
+`max` and `min` are nondifferentiable at exact ties. This engine chooses the
+HIPS-autograd convention: split the subgradient evenly across every tied
+extremum. That differs from PyTorch's argmax-style routing for some reductions,
+but it is symmetric and makes the reduction independent of memory order.
+
+For `y = max(x, axis)`:
+
+```
+mask = x == broadcast(y)
+∂L/∂x = mask ⊙ broadcast(ḡ_y) / sum(mask, axis, keepdims=True)
+```
+
+`min` uses the same rule with the minima mask. Away from ties this is the usual
+one-hot gradient to the unique extremum; at two equal maxima, each receives half
+the upstream gradient.
+
+---
+
+## LayerNorm (fused analysis, compositional code)
+
+`LayerNorm(dim)` normalizes over the trailing feature axes. For one normalized
+group:
+
+```
+μ = mean(x)
+var = mean((x - μ)²)
+x̂ = (x - μ) / sqrt(var + eps)
+y = gamma ⊙ x̂ + beta
+```
+
+The implementation is deliberately compositional (`mean`, subtract, multiply,
+power, divide, scale, shift), but the fused VJP is a useful check on the math.
+Let `ĝ = ḡ_y ⊙ gamma` and let `mean(...)` reduce over the normalized feature
+axes with `keepdims=True`. Then:
+
+```
+∂L/∂x = (1 / sqrt(var + eps)) ⊙ (ĝ - mean(ĝ) - x̂ ⊙ mean(ĝ ⊙ x̂))
+∂L/∂gamma = Σ_nonfeature_axes ḡ_y ⊙ x̂
+∂L/∂beta = Σ_nonfeature_axes ḡ_y
+```
+
+The central-difference LayerNorm test checks the compositional graph against
+this result indirectly: if any primitive VJP mishandles broadcasting or
+reductions, the LayerNorm gradient fails too.
+
+---
+
 ## Softmax cross-entropy (the clean one)
 
 For logits `z : (N, C)`, softmax `p_k = e^{z_k} / Σ_j e^{z_j}`, and the loss for

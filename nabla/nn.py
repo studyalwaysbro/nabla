@@ -7,6 +7,8 @@ of the module relies on the engine in ``tensor.py``.
 
 from __future__ import annotations
 
+import operator
+
 import numpy as np
 
 from nabla.tensor import Tensor, _requires_grad
@@ -31,6 +33,8 @@ class MLP:
     """Stack of Linear layers with a chosen activation between them."""
 
     def __init__(self, sizes, rng: np.random.Generator, activation="tanh"):
+        if activation not in {"relu", "tanh", "sigmoid"}:
+            raise ValueError("activation must be one of: relu, tanh, sigmoid")
         self.layers = [Linear(a, b, rng) for a, b in zip(sizes[:-1], sizes[1:])]
         self.activation = activation
 
@@ -38,11 +42,66 @@ class MLP:
         for i, layer in enumerate(self.layers):
             x = layer(x)
             if i < len(self.layers) - 1:            # no activation on the output
-                x = x.tanh() if self.activation == "tanh" else x.relu()
+                if self.activation == "tanh":
+                    x = x.tanh()
+                elif self.activation == "relu":
+                    x = x.relu()
+                else:
+                    x = x.sigmoid()
         return x
 
     def parameters(self):
         return [p for layer in self.layers for p in layer.parameters()]
+
+
+class Dropout:
+    """Inverted dropout with a module-level ``training`` flag."""
+
+    def __init__(self, p: float, rng: np.random.Generator):
+        if not 0.0 <= p < 1.0:
+            raise ValueError("dropout probability p must satisfy 0 <= p < 1")
+        self.p = float(p)
+        self.rng = rng
+        self.training = True
+
+    def __call__(self, x: Tensor) -> Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        mask = (self.rng.random(x.data.shape) >= self.p).astype(np.float64) / (1.0 - self.p)
+        return x * Tensor(mask, requires_grad=False)
+
+    def parameters(self):
+        return []
+
+
+class LayerNorm:
+    """Layer normalization over the trailing ``dim`` shape."""
+
+    def __init__(self, dim, eps=1e-5):
+        if isinstance(dim, tuple):
+            dim_shape = tuple(operator.index(d) for d in dim)
+        else:
+            dim_shape = (operator.index(dim),)
+        if not dim_shape or any(d <= 0 for d in dim_shape):
+            raise ValueError("LayerNorm dim must be a positive int or non-empty tuple of positive ints")
+
+        self.dim = dim_shape
+        self.eps = eps
+        self.gamma = Tensor(np.ones(dim_shape))
+        self.beta = Tensor(np.zeros(dim_shape))
+
+    def __call__(self, x: Tensor) -> Tensor:
+        if x.data.ndim < len(self.dim) or x.data.shape[-len(self.dim) :] != self.dim:
+            raise ValueError(f"LayerNorm expected input trailing shape {self.dim}, got {x.data.shape}")
+        axes = tuple(range(x.data.ndim - len(self.dim), x.data.ndim))
+        mean = x.mean(axis=axes, keepdims=True)
+        centered = x - mean
+        var = (centered * centered).mean(axis=axes, keepdims=True)
+        normalized = centered / ((var + self.eps) ** 0.5)
+        return normalized * self.gamma + self.beta
+
+    def parameters(self):
+        return [self.gamma, self.beta]
 
 
 class SGD:

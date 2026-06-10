@@ -49,16 +49,27 @@ it's *actually* right. This repo treats correctness as the deliverable:
 
 ## What's implemented
 
-**Core** (`nabla/tensor.py`) — one `Tensor` class, ~200 lines:
-`+`, `*`, `−`, `/`, `**`, `@` (matmul), `sum`, `mean`, `relu`, `tanh`, `exp`,
-`log`, all with broadcasting-aware VJPs and reverse-topological `backward()`,
-plus `no_grad()` and `detach()` for inference and graph boundaries.
+**Core** (`nabla/tensor.py`) — one `Tensor` class:
+`+`, `*`, `−`, `/`, `**`, `@` (matmul), `sum`, `mean`, `max`, `min`,
+`reshape`, `transpose`, indexing, `relu`, `tanh`, `sigmoid`, `exp`, `log`,
+`logsumexp`, `softmax`, plus module-level `concat` and `stack`, all with
+broadcasting-aware VJPs and reverse-topological `backward()`, plus `no_grad()`
+and `detach()` for inference and graph boundaries.
 
 **Neural nets** (`nabla/nn.py`): `Linear` (He init), `MLP`, `SGD` (with
-momentum), `Adam`, `AdamW`, `clip_grad_norm_`, `mse_loss`, and a fused,
-numerically-stable softmax `cross_entropy`. The layers and `mse_loss` compose
-`Tensor` ops; `cross_entropy` has a fused VJP for the standard softmax-loss
-gradient.
+momentum), `Adam`, `AdamW`, `Dropout`, `LayerNorm`, `clip_grad_norm_`,
+`mse_loss`, and a fused, numerically-stable softmax `cross_entropy`. The layers,
+`LayerNorm`, and `mse_loss` compose `Tensor` ops; `cross_entropy` has a fused
+VJP for the standard softmax-loss gradient.
+
+**Visualization** (`nabla/viz.py`): `draw_dot(tensor)` returns Graphviz DOT
+source without importing graphviz:
+
+```python
+from nabla import draw_dot
+
+dot = draw_dot(y)
+```
 
 ---
 
@@ -95,7 +106,7 @@ Requires Python ≥ 3.10 and NumPy.
 ## Roadmap
 
 - `Conv2d` and a max-pool VJP are deferred
-- a `graphviz` dump of the computation DAG
+- higher-level graph rendering wrappers around the DOT output
 
 ## License
 

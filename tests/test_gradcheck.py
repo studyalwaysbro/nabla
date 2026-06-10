@@ -17,13 +17,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from nabla import (
     Adam,
     AdamW,
+    Dropout,
+    LayerNorm,
     MLP,
     SGD,
     Tensor,
     clip_grad_norm_,
+    concat,
     cross_entropy,
     mse_loss,
     no_grad,
+    stack,
 )
 
 
@@ -140,6 +144,47 @@ def test_mean_tuple_axis():
     assert_close(gx, numeric_grad(f, x), "tuple-axis mean dx")
 
 
+def test_shape_ops_gradcheck():
+    x = Tensor(rng.standard_normal((2, 3, 4)))
+    f = lambda: (
+        x.reshape(3, 8).transpose(1, 0).tanh().sum()
+        + (x.transpose(2, 0, 1).reshape(4, 6) ** 2).mean()
+    )
+    gx, = analytic_grad(f, x)
+    assert_close(gx, numeric_grad(f, x), "reshape/transpose dx")
+
+    m = Tensor(rng.standard_normal((2, 3)))
+    f_t = lambda: (m.T.reshape(3, 2) ** 2).sum()
+    gm, = analytic_grad(f_t, m)
+    assert_close(gm, numeric_grad(f_t, m), "T dx")
+    assert_raises(ValueError, lambda: Tensor(rng.standard_normal((2, 3, 4))).T)
+
+
+def test_getitem_repeated_indices_gradcheck():
+    x = Tensor(rng.standard_normal((3, 2)))
+    idx = np.array([0, 0, 2])
+    weights = np.array([[1.0, -2.0], [3.0, 0.5], [-0.25, 4.0]])
+    f = lambda: (x[idx] * weights).sum()
+    gx, = analytic_grad(f, x)
+
+    expected = np.zeros_like(x.data)
+    np.add.at(expected, idx, weights)
+    assert_close(gx, expected, "getitem repeated-index scatter", tol=1e-12)
+    assert_close(gx, numeric_grad(f, x), "getitem repeated-index dx")
+
+
+def test_concat_and_stack_gradcheck():
+    a = Tensor(rng.standard_normal((2, 3)))
+    b = Tensor(rng.standard_normal((4, 3)))
+    f = lambda: (
+        (concat([a, b], axis=0) ** 2).mean()
+        + stack([a, a + 0.2], axis=1).tanh().sum()
+    )
+    ga, gb = analytic_grad(f, a, b)
+    assert_close(ga, numeric_grad(f, a), "concat/stack da")
+    assert_close(gb, numeric_grad(f, b), "concat db")
+
+
 def test_sub_and_division():
     x = Tensor(np.array([[1.2, 1.6, 2.1], [0.8, 1.1, 1.7]]))
     y = Tensor(np.array([[2.0, 1.5, 2.5]]))
@@ -186,6 +231,39 @@ def test_repeated_backward_accumulates_without_zero_grad():
 
     assert_close(gx, numeric_grad(fresh_graph, x), "repeat backward numeric dx")
     assert_close(gw, numeric_grad(fresh_graph, w), "repeat backward numeric dw")
+
+
+def test_sigmoid_logsumexp_softmax_gradcheck():
+    x = Tensor(rng.standard_normal((3, 4)))
+    weights = rng.standard_normal((3, 4))
+    f = lambda: (
+        (x.sigmoid() * weights).sum()
+        + x.logsumexp(axis=1).sum()
+        + (x.softmax(axis=1) * weights).sum()
+        + 0.3 * x.logsumexp()
+    )
+    gx, = analytic_grad(f, x)
+    assert_close(gx, numeric_grad(f, x), "sigmoid/logsumexp/softmax dx")
+
+
+def test_max_and_min_gradcheck_distinct_values():
+    x = Tensor(np.array([[1.2, -0.7, 0.4], [2.3, 0.1, -1.1], [-0.3, 1.7, 0.9]]))
+    col_weights = np.array([0.5, -1.5, 2.0])
+    f = lambda: (
+        x.max(axis=1).sum()
+        + (x.min(axis=0) * col_weights).sum()
+        + 0.25 * x.max()
+        - 0.4 * x.min()
+    )
+    gx, = analytic_grad(f, x)
+    assert_close(gx, numeric_grad(f, x), "max/min distinct dx")
+
+
+def test_max_ties_split_gradient_evenly():
+    x = Tensor(np.array([[2.0, 2.0, 1.0], [0.0, -1.0, 0.0]]))
+    x.max(axis=1).sum().backward()
+    expected = np.array([[0.5, 0.5, 0.0], [0.5, 0.0, 0.5]])
+    assert_close(x.grad, expected, "max tie split", tol=1e-12)
 
 
 def test_backward_handles_deep_graph_iteratively():
@@ -348,6 +426,33 @@ def test_clip_grad_norm_returns_preclip_norm_and_scales():
     assert_close(b.grad, np.array([12.0]) * scale, "clip grad b", tol=1e-12)
 
 
+def test_dropout_training_and_eval_modes():
+    local_rng = np.random.default_rng(123)
+    x = Tensor(np.ones((2, 5)))
+    dropout = Dropout(0.4, local_rng)
+    y = dropout(x)
+    y.sum().backward()
+    assert_close(x.grad, y.data, "dropout mask dx", tol=1e-12)
+    assert set(np.unique(y.data)).issubset({0.0, 1.0 / 0.6})
+
+    dropout.training = False
+    assert dropout(x) is x
+    assert_raises(ValueError, lambda: Dropout(1.0, local_rng))
+
+
+def test_layernorm_gradcheck():
+    x = Tensor(rng.standard_normal((2, 3)) + np.array([[0.0, 1.0, -1.0], [1.5, -0.5, 0.5]]))
+    layer = LayerNorm(3, eps=1e-4)
+    layer.gamma.data = np.array([1.2, -0.7, 0.4])
+    layer.beta.data = np.array([0.1, -0.2, 0.3])
+    weights = rng.standard_normal((2, 3))
+    f = lambda: (layer(x) * weights).sum()
+    gx, ggamma, gbeta = analytic_grad(f, x, layer.gamma, layer.beta)
+    assert_close(gx, numeric_grad(f, x), "layernorm dx", tol=1e-4)
+    assert_close(ggamma, numeric_grad(f, layer.gamma), "layernorm dgamma", tol=1e-4)
+    assert_close(gbeta, numeric_grad(f, layer.beta), "layernorm dbeta", tol=1e-4)
+
+
 def test_mlp_train_step_unaffected():
     local_rng = np.random.default_rng(123)
     x = Tensor([[0, 0], [0, 1], [1, 0], [1, 1]], requires_grad=False)
@@ -367,6 +472,16 @@ def test_mlp_train_step_unaffected():
     for p, old, grad in zip(params, before, grads):
         assert_close(p.data, old - 0.05 * grad, "mlp sgd step", tol=1e-12)
     assert x.grad is None
+
+
+def test_mlp_sigmoid_activation_and_validation():
+    local_rng = np.random.default_rng(456)
+    net = MLP([2, 3, 1], local_rng, activation="sigmoid")
+    x = Tensor(rng.standard_normal((4, 2)))
+    loss = net(x).sum()
+    loss.backward()
+    assert any(np.linalg.norm(p.grad) > 0 for p in net.parameters())
+    assert_raises(ValueError, lambda: MLP([2, 3, 1], local_rng, activation="gelu"))
 
 
 def test_cross_entropy_gradient():

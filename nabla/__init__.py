@@ -7,14 +7,19 @@
     x.grad          # -> [[2., 4., 6.]]   (d/dx of sum(x^2) = 2x)
 """
 
-from nabla.tensor import Tensor, no_grad
-from nabla.nn import Adam, AdamW, MLP, SGD, Linear, clip_grad_norm_, cross_entropy, mse_loss
+from nabla.tensor import Tensor, concat, no_grad, stack
+from nabla.nn import Adam, AdamW, Dropout, LayerNorm, MLP, SGD, Linear, clip_grad_norm_, cross_entropy, mse_loss
+from nabla.viz import draw_dot
 
 __version__ = "0.1.0"
 __all__ = [
     "Tensor",
+    "concat",
+    "stack",
     "no_grad",
     "Linear",
+    "Dropout",
+    "LayerNorm",
     "MLP",
     "SGD",
     "Adam",
@@ -22,4 +27,5 @@ __all__ = [
     "clip_grad_norm_",
     "mse_loss",
     "cross_entropy",
+    "draw_dot",
 ]

@@ -13,6 +13,7 @@ They're derived by hand in ``docs/derivations.md`` and checked numerically in
 from __future__ import annotations
 
 from contextlib import contextmanager
+import operator
 
 import numpy as np
 
@@ -34,6 +35,43 @@ def _unbroadcast(grad: np.ndarray, shape: tuple) -> np.ndarray:
         if dim == 1 and grad.shape[axis] != 1:
             grad = grad.sum(axis=axis, keepdims=True)
     return grad.reshape(shape)
+
+
+def _normalize_axes(axis, ndim: int):
+    if axis is None:
+        return None
+    axes = axis if isinstance(axis, tuple) else (axis,)
+    normalized = []
+    for ax in axes:
+        ax = operator.index(ax)
+        if ax < 0:
+            ax += ndim
+        if ax < 0 or ax >= ndim:
+            raise ValueError(f"axis {ax} is out of bounds for tensor of dimension {ndim}")
+        if ax in normalized:
+            raise ValueError("duplicate axis")
+        normalized.append(ax)
+    return tuple(normalized)
+
+
+def _expand_reduction_grad(grad: np.ndarray, axis, ndim: int, keepdims: bool) -> np.ndarray:
+    if axis is None or keepdims:
+        return grad
+    return np.expand_dims(grad, _normalize_axes(axis, ndim))
+
+
+def _squeeze_reduction(data: np.ndarray, axis, keepdims: bool) -> np.ndarray:
+    return data if keepdims else np.squeeze(data, axis=axis)
+
+
+def _freeze_index(idx):
+    if isinstance(idx, tuple):
+        return tuple(_freeze_index(part) for part in idx)
+    if isinstance(idx, np.ndarray):
+        return idx.copy()
+    if isinstance(idx, list):
+        return np.array(idx)
+    return idx
 
 
 def _ensure_tensor(value) -> "Tensor":
@@ -101,6 +139,71 @@ class Tensor:
         self.grad += grad
 
     # --------------------------------------------------------------- the ops
+    def reshape(self, *shape):
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        out = Tensor(
+            self.data.reshape(shape),
+            (self,),
+            "reshape",
+            requires_grad=_requires_grad(self),
+        )
+
+        def _backward():
+            self._add_grad(out.grad.reshape(self.data.shape))
+
+        if out.requires_grad:
+            out._backward = _backward
+        return out
+
+    def transpose(self, *axes):
+        if len(axes) == 0:
+            axes = tuple(reversed(range(self.data.ndim)))
+        elif len(axes) == 1 and isinstance(axes[0], (tuple, list)):
+            axes = tuple(axes[0])
+        else:
+            axes = tuple(axes)
+
+        out = Tensor(
+            self.data.transpose(axes),
+            (self,),
+            "transpose",
+            requires_grad=_requires_grad(self),
+        )
+        axes_normalized = _normalize_axes(axes, self.data.ndim)
+        inverse = np.argsort(axes_normalized)
+
+        def _backward():
+            self._add_grad(out.grad.transpose(inverse))
+
+        if out.requires_grad:
+            out._backward = _backward
+        return out
+
+    @property
+    def T(self):
+        if self.data.ndim != 2:
+            raise ValueError("Tensor.T is only defined for 2-D tensors; use transpose() for general axes")
+        return self.transpose(1, 0)
+
+    def __getitem__(self, idx):
+        idx = _freeze_index(idx)
+        out = Tensor(
+            self.data[idx],
+            (self,),
+            "getitem",
+            requires_grad=_requires_grad(self),
+        )
+
+        def _backward():
+            grad = np.zeros_like(self.data)
+            np.add.at(grad, idx, out.grad)
+            self._add_grad(grad)
+
+        if out.requires_grad:
+            out._backward = _backward
+        return out
+
     def __add__(self, other):
         other = _ensure_tensor(other)
         out = Tensor(
@@ -192,9 +295,7 @@ class Tensor:
         )
 
         def _backward():
-            g = out.grad
-            if axis is not None and not keepdims:
-                g = np.expand_dims(g, axis)
+            g = _expand_reduction_grad(out.grad, axis, self.data.ndim, keepdims)
             self._add_grad(np.broadcast_to(g, self.data.shape))
 
         if out.requires_grad:
@@ -204,10 +305,9 @@ class Tensor:
     def mean(self, axis=None, keepdims=False):
         if axis is None:
             n = self.data.size
-        elif isinstance(axis, tuple):
-            n = int(np.prod([self.data.shape[a] for a in axis]))
         else:
-            n = self.data.shape[axis]
+            axes = _normalize_axes(axis, self.data.ndim)
+            n = int(np.prod([self.data.shape[a] for a in axes]))
         return self.sum(axis=axis, keepdims=keepdims) * (1.0 / n)
 
     def relu(self):
@@ -236,12 +336,98 @@ class Tensor:
             out._backward = _backward
         return out
 
+    def sigmoid(self):
+        s = np.empty_like(self.data)
+        positive = self.data >= 0
+        s[positive] = 1.0 / (1.0 + np.exp(-self.data[positive]))
+        exp_x = np.exp(self.data[~positive])
+        s[~positive] = exp_x / (1.0 + exp_x)
+        out = Tensor(s, (self,), "sigmoid", requires_grad=_requires_grad(self))
+
+        def _backward():
+            self._add_grad(s * (1.0 - s) * out.grad)
+
+        if out.requires_grad:
+            out._backward = _backward
+        return out
+
     def exp(self):
         e = np.exp(self.data)
         out = Tensor(e, (self,), "exp", requires_grad=_requires_grad(self))
 
         def _backward():
             self._add_grad(e * out.grad)               # d/dx exp = exp
+
+        if out.requires_grad:
+            out._backward = _backward
+        return out
+
+    def logsumexp(self, axis=None, keepdims=False):
+        m = np.max(self.data, axis=axis, keepdims=True)
+        shifted_exp = np.exp(self.data - m)
+        y_keepdims = m + np.log(shifted_exp.sum(axis=axis, keepdims=True))
+        out = Tensor(
+            _squeeze_reduction(y_keepdims, axis, keepdims),
+            (self,),
+            "logsumexp",
+            requires_grad=_requires_grad(self),
+        )
+
+        def _backward():
+            g = _expand_reduction_grad(out.grad, axis, self.data.ndim, keepdims)
+            self._add_grad(np.exp(self.data - y_keepdims) * np.broadcast_to(g, self.data.shape))
+
+        if out.requires_grad:
+            out._backward = _backward
+        return out
+
+    def softmax(self, axis=-1):
+        m = np.max(self.data, axis=axis, keepdims=True)
+        shifted_exp = np.exp(self.data - m)
+        p = shifted_exp / shifted_exp.sum(axis=axis, keepdims=True)
+        out = Tensor(p, (self,), "softmax", requires_grad=_requires_grad(self))
+
+        def _backward():
+            dot = (out.grad * p).sum(axis=axis, keepdims=True)
+            self._add_grad(p * (out.grad - dot))
+
+        if out.requires_grad:
+            out._backward = _backward
+        return out
+
+    def max(self, axis=None, keepdims=False):
+        y_keepdims = np.max(self.data, axis=axis, keepdims=True)
+        out = Tensor(
+            _squeeze_reduction(y_keepdims, axis, keepdims),
+            (self,),
+            "max",
+            requires_grad=_requires_grad(self),
+        )
+        mask = self.data == y_keepdims
+        ties = mask.sum(axis=axis, keepdims=True)
+
+        def _backward():
+            g = _expand_reduction_grad(out.grad, axis, self.data.ndim, keepdims)
+            self._add_grad(mask * np.broadcast_to(g, self.data.shape) / ties)
+
+        if out.requires_grad:
+            out._backward = _backward
+        return out
+
+    def min(self, axis=None, keepdims=False):
+        y_keepdims = np.min(self.data, axis=axis, keepdims=True)
+        out = Tensor(
+            _squeeze_reduction(y_keepdims, axis, keepdims),
+            (self,),
+            "min",
+            requires_grad=_requires_grad(self),
+        )
+        mask = self.data == y_keepdims
+        ties = mask.sum(axis=axis, keepdims=True)
+
+        def _backward():
+            g = _expand_reduction_grad(out.grad, axis, self.data.ndim, keepdims)
+            self._add_grad(mask * np.broadcast_to(g, self.data.shape) / ties)
 
         if out.requires_grad:
             out._backward = _backward
@@ -367,3 +553,41 @@ class Tensor:
                     v.grad = public_grad
         finally:
             Tensor._active_backward_grads = None
+
+
+def concat(tensors, axis=0):
+    tensors = tuple(_ensure_tensor(t) for t in tensors)
+    if not tensors:
+        raise ValueError("concat requires at least one tensor")
+    axis = operator.index(axis)
+    data = np.concatenate([t.data for t in tensors], axis=axis)
+    out = Tensor(data, tensors, "concat", requires_grad=_requires_grad(*tensors))
+    axis_normalized = axis if axis >= 0 else axis + data.ndim
+    sizes = [t.data.shape[axis_normalized] for t in tensors]
+    splits = np.cumsum(sizes)[:-1]
+
+    def _backward():
+        for tensor, grad in zip(tensors, np.split(out.grad, splits, axis=axis_normalized)):
+            tensor._add_grad(grad)
+
+    if out.requires_grad:
+        out._backward = _backward
+    return out
+
+
+def stack(tensors, axis=0):
+    tensors = tuple(_ensure_tensor(t) for t in tensors)
+    if not tensors:
+        raise ValueError("stack requires at least one tensor")
+    axis = operator.index(axis)
+    data = np.stack([t.data for t in tensors], axis=axis)
+    out = Tensor(data, tensors, "stack", requires_grad=_requires_grad(*tensors))
+    axis_normalized = axis if axis >= 0 else axis + data.ndim
+
+    def _backward():
+        for i, tensor in enumerate(tensors):
+            tensor._add_grad(np.take(out.grad, i, axis=axis_normalized))
+
+    if out.requires_grad:
+        out._backward = _backward
+    return out
